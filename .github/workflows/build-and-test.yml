@@ -32,46 +32,56 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Check whether workflow was triggered by PR
+          is_pr=${{ github.event_name == 'pull_request' }}
+
           # Platforms
           platforms=(cpu cuda rocm)
 
           # Names of the images
           base_image_name=ghcr.io/${{ github.repository }}-base       # ghcr.io/ocean-data-factory-sweden/kso-base
           final_image_name=ghcr.io/${{ github.repository }}           # ghcr.io/ocean-data-factory-sweden/kso
-          pr_build_tag=pr${{ github.event.pull_request.number }}      # pr480
-          pr_base_tag=${{ github.event.pull_request.base.ref }}       # dev
+          if $is_pr; then
+            build_tag=pr${{ github.event.pull_request.number }}       # pr480
+            pr_base_tag=${{ github.event.pull_request.base.ref }}     # dev
+          else
+            build_tag=${{ github.ref_name }}                          # dev
+          fi
           cache_tag=buildcache                                        # buildcache
 
-          # Default reference sha to PR base sha
-          ref_sha=${{ github.event.pull_request.base.sha }}
-          echo -e "Base commit: $ref_sha"
+          # Check changed files since previous successful workflow run for PRs
+          if $is_pr; then
+            # Default reference sha to PR base sha
+            ref_sha=${{ github.event.pull_request.base.sha }}
+            echo -e "Base commit: $ref_sha"
 
-          # This would be the commit sha before this push
-          # ref_sha="${{ github.event.before }}"
+            # This would be the commit sha before this push
+            # ref_sha="${{ github.event.before }}"
 
-          # Find commit shas of the successful workflow runs
-          shas=$(gh api repos/${{ github.repository }}/actions/runs --paginate \
-            --jq "[.workflow_runs[] | select(.pull_requests[]?.number == ${{ github.event.pull_request.number }} and .name == \"Build and Test\" and .conclusion == \"success\") | .head_sha] | .[]")
+            # Find commit shas of the successful workflow runs
+            shas=$(gh api repos/${{ github.repository }}/actions/runs --paginate \
+              --jq "[.workflow_runs[] | select(.pull_requests[]?.number == ${{ github.event.pull_request.number }} and .name == \"Build and Test\" and .conclusion == \"success\") | .head_sha] | .[]")
 
-          # Find the most recent sha that exists and set that as reference sha
-          # (all of them might not exist if the branch has been rebased)
-          for sha in $shas; do
-            if git cat-file -e "$sha"^{commit} 2>/dev/null; then
-              ref_sha=$sha
-              echo -e "Found commit with previous successful build: $ref_sha"
-              break
-            fi
-          done
+            # Find the most recent sha that exists and set that as reference sha
+            # (all of them might not exist if the branch has been rebased)
+            for sha in $shas; do
+              if git cat-file -e "$sha"^{commit} 2>/dev/null; then
+                ref_sha=$sha
+                echo -e "Found commit with previous successful build: $ref_sha"
+                break
+              fi
+            done
 
-          # Current commit sha
-          head_sha=${{ github.event.after }}
+            # Current commit sha
+            head_sha=${{ github.event.after }}
 
-          # Compare
-          echo -e "Diffing from $ref_sha to $head_sha"
-          git diff --name-only "$ref_sha" "$head_sha" > changed.txt
+            # Compare
+            echo -e "Diffing from $ref_sha to $head_sha"
+            git diff --name-only "$ref_sha" "$head_sha" > changed.txt
 
-          echo -e "\nChanged files:"
-          cat changed.txt
+            echo -e "\nChanged files:"
+            cat changed.txt
+          fi
 
           # Helper function for editing file inline with jq
           jq_inline() {
@@ -124,40 +134,50 @@ jobs:
                 ;;
             esac
 
-            # Check whether the base image needs to be built; do it at least once per PR (using the cache from dev)
-            build_base_image=false
-            base_image=$base_image_name:$pr_build_tag-$platform_tag
-            # Build if this ci workflow has changed
-            if grep -qF '.github/workflows/build-and-test.yml' changed.txt; then
-              build_base_image=true
-            fi
-            # Build if container recipe has changed
-            if grep -qE '^containers/base/' changed.txt; then
-              build_base_image=true
-            fi
-            # Build if python packages have changed
-            if grep -qF 'requirements.txt' changed.txt; then
-              build_base_image=true
-            fi
-            if grep -qF "$python_requirements" changed.txt; then
-              build_base_image=true
-            fi
-
-            # Find existing image to be used if not building base image
-            if ! $build_base_image; then
-              if ! docker manifest inspect "$pr_image" > /dev/null 2>&1; then
-                # No existing image found; need to build a new image
+            # Check whether the base image needs to be built
+            if $is_pr; then
+              # Build base image only if needed for PR
+              build_base_image=false
+              # Build if this ci workflow has changed
+              if grep -qF '.github/workflows/build-and-test.yml' changed.txt; then
                 build_base_image=true
               fi
-            fi
+              # Build if container recipe has changed
+              if grep -qE '^containers/base/' changed.txt; then
+                build_base_image=true
+              fi
+              # Build if python packages have changed
+              if grep -qF 'requirements.txt' changed.txt; then
+                build_base_image=true
+              fi
+              if grep -qF "$python_requirements" changed.txt; then
+                build_base_image=true
+              fi
 
-            # Final image
+              # Find existing image to be used if not building base image
+              if ! $build_base_image; then
+                if ! docker manifest inspect "$base_image" > /dev/null 2>&1; then
+                  # No existing image found; need to build a new image
+                  build_base_image=true
+                fi
+              fi
+            else
+              # Build base image always for dev and main
+              build_base_image=true
+            fi
+            base_image=$base_image_name:$build_tag-$platform_tag
+
+            # Build final image always
             build_final_image=true
-            final_image=$final_image_name:$pr_build_tag-$platform_tag
+            final_image=$final_image_name:$build_tag-$platform_tag
 
             # Build caches
-            base_image_cache_to="type=registry,ref=$base_image_name:$cache_tag-$pr_build_tag-$platform_tag,mode=max"
-            base_image_cache_from="type=registry,ref=$base_image_name:$cache_tag-$pr_build_tag-$platform_tag"$'\n'"type=registry,ref=$base_image_name:$cache_tag-$pr_base_tag-$platform_tag"
+            base_image_cache_to="type=registry,ref=$base_image_name:$cache_tag-$build_tag-$platform_tag,mode=max"
+            base_image_cache_from="type=registry,ref=$base_image_name:$cache_tag-$build_tag-$platform_tag"
+            if $is_pr; then
+              # Add cache of base branch for PRs
+              base_image_cache_from="$base_image_cache_from"$'\n'"type=registry,ref=$base_image_name:$cache_tag-$pr_base_tag-$platform_tag"
+            fi
 
             # Update platform lists
             if $build_base_image; then
